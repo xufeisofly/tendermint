@@ -316,6 +316,7 @@ func (cs *State) OnStart() error {
 
 	// We may have lost some votes if the process crashed reload from consensus
 	// log to catchup.
+	// 尝试从 WAL 文件中恢复 crash 之前的状态
 	if cs.doWALCatchup {
 		repairAttempted := false
 
@@ -704,6 +705,8 @@ func (cs *State) newStep() {
 // It keeps the RoundState and is the only thing that updates it.
 // Updates (state transitions) happen on timeouts, complete proposals, and 2/3 majorities.
 // State must be locked before any internal state is updated.
+
+// 这就是一个 msg router 协程，一个死循环不断 handle 不同的 msg
 func (cs *State) receiveRoutine(maxSteps int) {
 	onExit := func(cs *State) {
 		// NOTE: the internalMsgQueue may have signed messages from our
@@ -751,12 +754,14 @@ func (cs *State) receiveRoutine(maxSteps int) {
 			cs.handleTxsAvailable()
 
 		case mi = <-cs.peerMsgQueue:
+			// 接到消息就写如 wal
 			if err := cs.wal.Write(mi); err != nil {
 				cs.Logger.Error("failed writing to WAL", "err", err)
 			}
 
 			// handles proposals, block parts, votes
 			// may generate internal events (votes, complete proposals, 2/3 majorities)
+			// 处理 Proposal, votes 消息等，block parts 是什么消息？
 			cs.handleMsg(mi)
 
 		case mi = <-cs.internalMsgQueue:
@@ -813,6 +818,7 @@ func (cs *State) handleMsg(mi msgInfo) {
 		err = cs.setProposal(msg.Proposal)
 
 	case *BlockPartMessage:
+		// 只有 Proposal 有可能被拆分成多个 part 吗？其他类型貌似不会
 		// if the proposal is complete, we'll enterPrevote or tryFinalizeCommit
 		added, err = cs.addProposalBlockPart(msg, peerID)
 
@@ -831,6 +837,7 @@ func (cs *State) handleMsg(mi msgInfo) {
 
 		cs.mtx.Lock()
 		if added && cs.ProposalBlockParts.IsComplete() {
+			// 貌似确实是只有 proposal 会被拆分成多个 part
 			cs.handleCompleteProposal(msg.Height)
 		}
 		if added {
@@ -1912,6 +1919,8 @@ func (cs *State) handleCompleteProposal(blockHeight int64) {
 	// Update Valid* if we can.
 	prevotes := cs.Votes.Prevotes(cs.Round)
 	blockID, hasTwoThirds := prevotes.TwoThirdsMajority()
+	// 收到完整 Proposal 时已经有足够的 prevote 投票了（可能是上一个 round 收集的投票）
+	// 可以直接设置 ValidRound 等信息
 	if hasTwoThirds && !blockID.IsZero() && (cs.ValidRound < cs.Round) {
 		if cs.ProposalBlock.HashesTo(blockID.Hash) {
 			cs.Logger.Debug(
@@ -1929,12 +1938,17 @@ func (cs *State) handleCompleteProposal(blockHeight int64) {
 		// proposer is faulty or voting power of faulty processes is more
 		// than 1/3. We should trigger in the future accountability
 		// procedure at this point.
+
+		// 哦哦哦？Tendermint 也要引入 accountable finality 吗？
+		// 不过这已经是 2018 年的注释了……
 	}
 
 	if cs.Step <= cstypes.RoundStepPropose && cs.isProposalComplete() {
 		// Move onto the next step
+		// 进入 Prevote 阶段并投票 prevote
 		cs.enterPrevote(blockHeight, cs.Round)
 		if hasTwoThirds { // this is optimisation as this will be triggered when prevote is added
+			// 如果 prevote 投票已经凑够直接进入 precommit 阶段
 			cs.enterPrecommit(blockHeight, cs.Round)
 		}
 	} else if cs.Step == cstypes.RoundStepCommit {
@@ -2269,6 +2283,8 @@ func (cs *State) updatePrivValidatorPubKey() error {
 }
 
 // look back to check existence of the node's consensus votes before joining consensus
+// 刚刚加入共识委员会时会确保以前的区块没有该节点参与
+// 为什么？而且为什么是自己检查自己的，不应该互相检查或者第三方检查吗？
 func (cs *State) checkDoubleSigningRisk(height int64) error {
 	if cs.privValidator != nil && cs.privValidatorPubKey != nil && cs.config.DoubleSignCheckHeight > 0 && height > 0 {
 		valAddr := cs.privValidatorPubKey.Address()
